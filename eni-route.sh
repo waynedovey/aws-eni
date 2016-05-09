@@ -55,7 +55,7 @@ else
    echo "Retrieved VPC CIDR range ${VPC_CIDR_RANGE_ETH1} from meta-data."
 fi
 
-VPC_URI_ETH1_IP="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH0_MAC}/local-ipv4s"
+VPC_URI_ETH1_IP="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH1_MAC}/local-ipv4s"
 echo "Metadata location for vpc ipv4 add: ${VPC_URI_ETH1_IP}"
 
 VPC_ETH1_IP=$(curl --retry 3 --silent --fail ${VPC_URI_ETH1_IP})
