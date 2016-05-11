@@ -1,0 +1,272 @@
+#!/bin/bash
+
+# chkconfig: - 15 75
+### BEGIN INIT INFO
+# Provides:          pipeline_eni
+# Required-Start:    $local_fs $network
+# Required-Stop:     $local_fs $network
+# Default-Start:     3 5
+# Default-Stop:      0 1 6
+# Short-Description: Attach Pipeline managed Elastic Network Interfaces
+### END INIT INFO
+
+function interface_status() {
+    aws ec2 describe-network-interfaces --network-interface-ids $1 |\
+     jq -r '.NetworkInterfaces[0] |
+                .Status + " " +
+                if has("Attachment")
+                then
+                    .Attachment.AttachmentId + " " + .Attachment.InstanceId
+                else
+                    "none none"
+                end'
+}
+
+function attach_interface() {
+
+    INTERFACE_ID=$1
+    DEVICE_INDEX=$2
+
+    echo "Attaching $INTERFACE_ID"
+
+    # Wait until the previous instance has detached (or AS has shut it down).
+    while :
+    do
+        INTERFACE_INFO=($(interface_status ${INTERFACE_ID}))
+        INTERFACE_STATUS=${INTERFACE_INFO[0]}
+        INTERFACE_ATTACHMENT_ID=${INTERFACE_INFO[1]}
+        INTERFACE_ATTACHMENT_INSTANCE_ID=${INTERFACE_INFO[2]}
+
+        if [ "${INTERFACE_STATUS}" = "available" -o "${INSTANCE_ID}" = "${INTERFACE_ATTACHMENT_INSTANCE_ID}" ]; then
+	        echo "Found ${INTERFACE_ID} is available or already attached to us"
+            break;
+        fi
+        echo "Interface ${INTERFACE_ID} is still ${INTERFACE_STATUS}. Waiting..."
+        sleep 5
+    done
+
+    if [ ! "${INTERFACE_ATTACHMENT_INSTANCE_ID}" = "${INSTANCE_ID}" ]; then
+        echo "Interface ${INTERFACE_ID} is ready for attaching."
+        aws ec2 attach-network-interface --network-interface-id ${INTERFACE_ID} --instance ${INSTANCE_ID} --device-index ${DEVICE_INDEX}
+        # RHEL6 & 7 requires manual configuration of additional interfaces
+        # see Dean Samuels' post - https://forums.aws.amazon.com/thread.jspa?threadID=112312
+        # Testing new configuration
+
+        if [ -f /etc/redhat-release ]; then
+            if (grep -q "6." /etc/redhat-release); then
+                cp /etc/sysconfig/network-scripts/ifcfg-eth0 /etc/sysconfig/network-scripts/ifcfg-eth${DEVICE_INDEX}
+                sed -i 's/DEVICE=.*/DEVICE="eth'${DEVICE_INDEX}'"/g' /etc/sysconfig/network-scripts/ifcfg-eth${DEVICE_INDEX}
+                if (! grep -q "GATEWAYDEV" /etc/sysconfig/network); then
+                    echo -e "GATEWAYDEV=eth0" >> /etc/sysconfig/network
+                fi
+                GATEWAY=($(ip route show | awk '/default+.+eth0/ {print $3}'))
+                INTERFACE_IPADDRESS=($(aws ec2 describe-network-interfaces --network-interface-ids ${INTERFACE_ID} |\
+                 jq -r '.NetworkInterfaces[].PrivateIpAddress'))
+                #Though the new eni is attached and configured the instance has not been instructed to route traffic to it
+                #Copied these settings from Amazon Linux configuration
+                echo "169.254.169.254 via 0.0.0.0 dev eth0" > /etc/sysconfig/network-scripts/route-eth0
+                echo "default via ${GATEWAY} dev eth${DEVICE_INDEX} table 1000${DEVICE_INDEX}" >\
+                 /etc/sysconfig/network-scripts/route-eth${DEVICE_INDEX}
+                echo "default via ${GATEWAY} dev eth${DEVICE_INDEX} metric 1000${DEVICE_INDEX}" >>\
+                 /etc/sysconfig/network-scripts/route-eth${DEVICE_INDEX}
+                echo "Added Redhat specific config"
+                ip rule add from ${INTERFACE_IPADDRESS} table 1000${DEVICE_INDEX}
+                echo "Restarting network for RHEL6"
+                sleep 10 # t2.micro needs a bit of time
+                /etc/init.d/network restart
+            elif (grep -q "7." /etc/redhat-release); then
+                dhclient
+                cp /etc/sysconfig/network-scripts/ifcfg-eth0 /etc/sysconfig/network-scripts/ifcfg-eth${DEVICE_INDEX}
+                sed -i 's/DEVICE=.*/DEVICE="eth'${DEVICE_INDEX}'"/g' /etc/sysconfig/network-scripts/ifcfg-eth${DEVICE_INDEX}
+                if (! grep -q "GATEWAYDEV" /etc/sysconfig/network); then
+                    echo -e "GATEWAYDEV=eth0" >> /etc/sysconfig/network
+                fi
+                GATEWAY=($(ip route show | awk '/default+.+eth0/ {print $3}'))
+
+                #Custom Piece for RHEL 7
+                #eth0 setup
+                ETH0_MAC=$(cat /sys/class/net/eth0/address) ||
+                    die "Unable to determine MAC address on eth0."
+                echo "Found MAC ${ETH0_MAC} for eth0."
+
+                URI_ETH0="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH0_MAC}/subnet-ipv4-cidr-block"
+                echo "Metadata location for ipv4 range: ${URI_ETH0}"
+
+                RANGE_ETH0=$(curl --retry 3 --silent --show-error --fail -L ${URI_ETH0})
+                if [ $? -ne 0 ]; then
+                    echo "Unable to retrive CIDR range from meta-data"
+                    RANGE_ETH0="169.254.169.254"
+                else
+                    echo "Retrieved eth0 CIDR range ${RANGE_ETH0} from meta-data."
+                fi
+
+                URI_ETH0_IP="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH0_MAC}/local-ipv4s"
+                echo "Metadata location for ipv4 add: ${URI_ETH0_IP}"
+
+                ETH0_IP=$(curl --retry 3 --silent --show-error --fail -L ${URI_ETH0_IP})
+
+                if [ $? -ne 0 ]; then
+                    echo "Unable to retrive eth0 IP from meta-data, using null instead"
+                    ETH0_IP=""
+                else
+                    echo "Retrieved eth0 IP ${ETH0_IP} from meta-data."
+                fi
+                #eth1 setup
+                ETH1_MAC=$(cat /sys/class/net/eth1/address) ||
+                    die "Unable to determine MAC address on eth1."
+                echo "Found MAC ${ETH0_MAC} for eth1."
+
+                URI_ETH1="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH1_MAC}/subnet-ipv4-cidr-block"
+                echo "Metadata location for ipv4 range: ${URI_ETH1}"
+
+                RANGE_ETH1=$(curl --retry 3 --silent --show-error --fail -L ${URI_ETH1})
+                if [ $? -ne 0 ]; then
+                    echo "Unable to retrive CIDR range from meta-data"
+                    RANGE_ETH0="169.254.169.254"
+                else
+                    echo "Retrieved eth1 CIDR range ${RANGE_ETH1} from meta-data."
+                fi
+
+                URI_ETH1_IP="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH1_MAC}/local-ipv4s"
+                echo "Metadata location for ipv4 add: ${URI_ETH0_IP}"
+
+                ETH1_IP=$(curl --retry 3 --silent --show-error --fail -L ${URI_ETH1_IP})
+
+                if [ $? -ne 0 ]; then
+                    echo "Unable to retrive eth0 IP from meta-data, using null instead"
+                    ETH1_IP=""
+                else
+                    echo "Retrieved eth1 IP ${ETH1_IP} from meta-data."
+                fi
+                #Routes and Rules using NMI CLI
+                ip route add ${RANGE_ETH0} dev eth0 tab 1
+                ip route add ${RANGE_ETH1} dev eth1 tab 2
+
+                ip route add default via ${GATEWAY} dev eth0 tab 1
+                ip route add default via ${GATEWAY} dev eth1 tab 2
+
+                ip rule add from ${ETH0_IP}/32 tab 1 priority 100
+                ip rule add from ${ETH1_IP}/32 tab 2 priority 200
+
+                ip route flush cache
+
+                #echo "${RANGE_ETH0} dev eth0 tab 1" > /etc/sysconfig/network-scripts/route-eth0
+                #echo "default via ${GATEWAY} dev eth0 tab 1" >> /etc/sysconfig/network-scripts/route-eth0
+                #echo "${RANGE_ETH1} dev eth1 tab 2" > /etc/sysconfig/network-scripts/route-eth1
+                #echo "default via ${GATEWAY} dev eth1 tab 2" >> /etc/sysconfig/network-scripts/route-eth1
+                #echo "from ${ETH0_IP}/32 tab 1 priority 100" > /etc/sysconfig/network-scripts/rule-eth0
+                #echo "from ${ETH1_IP}/32 tab 2 priority 200" > /etc/sysconfig/network-scripts/rule-eth1
+                echo "Restarting network for RHEL7"
+                sleep 10 # t2.micro needs a bit of time
+                #/etc/init.d/network restart
+            fi
+       fi
+    fi
+
+    # Wait for the interface to be up before we complete
+    until ip address show dev eth${DEVICE_INDEX} | grep "inet "
+    do
+        INTERFACE_INFO=($(interface_status ${INTERFACE_ID}))
+        INTERFACE_STATUS=${INTERFACE_INFO[0]}
+        echo "Interface ${INTERFACE_ID} is ${INTERFACE_STATUS} but eth${DEVICE_INDEX} is not available. Waiting..."
+        sleep 5
+    done
+
+    sleep 5
+    echo "Interface ${INTERFACE_ID} on eth${DEVICE_INDEX} is ready"
+}
+
+# Detach from ourselves only
+function detach_interface() {
+    INTERFACE_ID=$1
+
+    INTERFACE_INFO=($(interface_status ${INTERFACE_ID}))
+    INTERFACE_STATUS=${INTERFACE_INFO[0]}
+    INTERFACE_ATTACHMENT_ID=${INTERFACE_INFO[1]}
+    INTERFACE_ATTACHMENT_INSTANCE_ID=${INTERFACE_INFO[2]}
+
+    if [ "${INTERFACE_ATTACHMENT_INSTANCE_ID}" = "${INSTANCE_ID}" ]; then
+        aws ec2 detach-network-interface --attachment-id ${INTERFACE_ATTACHMENT_ID}
+        echo "Detached {$INTERFACE_ID} from ${INSTANCE_ID}"
+    else
+        echo "Interface ${INTERFACE_ID} is not attached to ${INSTANCE_ID}. Ignoring".
+    fi
+}
+
+function eni_metadata() {
+    # Metadata is JSON encoded array of Name, NetworkInterfaceId
+    #jq1.3 (rhel version) has a bug requires Pipeline::ENIAt... in []
+    aws cloudformation describe-stack-resource --stack-name ${StackName} --logical-resource-id $1 | \
+        jq -r '.StackResourceDetail.Metadata' | \
+        jq -r '.["Pipeline::ENIAttachInterfaces"] | map(.Name + " " + .NetworkInterfaceId) | .[]'
+}
+
+# Send log output to the system logs - needs more work to kill the process at the end..
+#exec > >(logger -t 'eni-attach-interfaces') 2> >(logger -t 'eni-attach-interfaces-error')
+
+# Exit script on error
+set -e
+
+. /etc/profile
+export HTTPS_PROXY
+export HTTP_PROXY
+export StackName
+
+# This will tell us the interface ids of all the instances we should be consuming
+
+COMMAND=$1
+CURL_META_DATA="curl --retry 3 --silent --show-error --fail -L http://169.254.169.254/latest/meta-data"
+
+export INSTANCE_ID=$(${CURL_META_DATA}/instance-id)
+export AVAILABILITY_ZONE=$(${CURL_META_DATA}/placement/availability-zone)
+# chop last char from AZ to get the region...
+export AWS_DEFAULT_REGION=${AVAILABILITY_ZONE%?}
+
+echo "Found Metadata ${INSTANCE_ID} ${AVAILABILITY_ZONE} ${AWS_DEFAULT_REGION}"
+
+# Ok, this is a bit messy... See lib/builders/autoheal.rb
+# we attach the volume ids as metadata to either the Instance resource or the LaunchConfig resource
+if [ "$1" = 'bake' ]; then
+    RESOURCE='Instance'
+else
+    RESOURCE='LaunchConfig'
+fi
+
+PIDS=""
+device_index=0
+while read interface_name inteface_id
+do
+    echo "Found interface ${interface_name} ${inteface_id}"
+
+    ((device_index+=1))
+
+    case "$1" in
+        bake)
+            if [ "${inteface_id}" = "persistent" ] ; then
+                echo "Skipping attachment of ${inteface_id} interface ${interface_name}"
+            else
+                attach_interface "${inteface_id}" "${device_index}" &
+                PIDS="${PIDS} $!"
+            fi
+            ;;
+        start)
+            attach_interface "${inteface_id}" "${device_index}" &
+            PIDS="${PIDS} $!"
+           ;;
+        stop)
+            detach_interface "${inteface_id}" &
+            PIDS="${PIDS} $!"
+            ;;
+    esac
+done < <(eni_metadata $RESOURCE)
+
+echo "started ${PIDS}"
+
+for p in ${PIDS}
+do
+    echo "Waiting for $p"
+    wait $p || exit 1
+done
+
+echo "Attach Interfaces Complete"
+exit 0
